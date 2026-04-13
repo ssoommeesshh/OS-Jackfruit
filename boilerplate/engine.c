@@ -5,6 +5,9 @@
  *   Task 1 - Multi-container runtime with parent supervisor
  *   Task 2 - Supervisor CLI + IPC (UNIX domain socket control channel)
  *   Task 3 - Bounded-buffer logging pipeline (producer/consumer threads)
+ *   Task 4 - Kernel monitor integration: ioctl register/unregister,
+ *             termination reason attribution (normal/stopped/hard_limit_killed),
+ *             full metadata in ps output (limits, nice, reason)
  */
 
 #define _GNU_SOURCE
@@ -64,6 +67,22 @@ typedef enum {
     CONTAINER_EXITED
 } container_state_t;
 
+/*
+ * Task 4 attribution rule:
+ *   REASON_NONE          – still running or just started
+ *   REASON_NORMAL_EXIT   – exited with a status code (no signal)
+ *   REASON_STOPPED       – supervisor issued stop (stop_requested flag was set)
+ *   REASON_HARD_LIMIT    – SIGKILL from kernel monitor (stop_requested NOT set)
+ *   REASON_UNKNOWN_SIGNAL– died from a signal we didn't send
+ */
+typedef enum {
+    REASON_NONE = 0,
+    REASON_NORMAL_EXIT,
+    REASON_STOPPED,
+    REASON_HARD_LIMIT_KILLED,
+    REASON_UNKNOWN_SIGNAL
+} termination_reason_t;
+
 /* ------------------------------------------------------------------ */
 /* Data structures                                                     */
 /* ------------------------------------------------------------------ */
@@ -79,9 +98,11 @@ typedef struct container_record {
     container_state_t       state;
     unsigned long           soft_limit_bytes;
     unsigned long           hard_limit_bytes;
+    int                     nice_value;
     int                     exit_code;
     int                     exit_signal;
-    int                     stop_requested;   /* set before sending SIGTERM */
+    int                     stop_requested;       /* set BEFORE sending SIGTERM/KILL */
+    termination_reason_t    termination_reason;   /* Task 4 attribution rule */
     char                    log_path[PATH_MAX];
     struct container_record *next;
 } container_record_t;
@@ -200,6 +221,18 @@ static const char *state_to_string(container_state_t s)
     case CONTAINER_KILLED:   return "killed";
     case CONTAINER_EXITED:   return "exited";
     default:                 return "unknown";
+    }
+}
+
+static const char *reason_to_string(termination_reason_t r)
+{
+    switch (r) {
+    case REASON_NONE:             return "-";
+    case REASON_NORMAL_EXIT:      return "normal";
+    case REASON_STOPPED:          return "stopped";
+    case REASON_HARD_LIMIT_KILLED:return "hard_limit_killed";
+    case REASON_UNKNOWN_SIGNAL:   return "signal";
+    default:                      return "unknown";
     }
 }
 
@@ -540,6 +573,12 @@ static void handle_sigint(int sig)
 /*
  * SIGCHLD handler: reap all exited children without blocking.
  * Updates container metadata for any PID we recognise.
+ *
+ * Task 4 attribution rule:
+ *   - Normal exit           → REASON_NORMAL_EXIT
+ *   - stop_requested + any signal → REASON_STOPPED
+ *   - SIGKILL + !stop_requested  → REASON_HARD_LIMIT_KILLED
+ *   - other signal          → REASON_UNKNOWN_SIGNAL
  */
 static void handle_sigchld(int sig)
 {
@@ -554,15 +593,23 @@ static void handle_sigchld(int sig)
             if (c->host_pid != pid) continue;
 
             if (WIFEXITED(status)) {
-                c->exit_code = WEXITSTATUS(status);
-                c->state = CONTAINER_EXITED;
+                c->exit_code          = WEXITSTATUS(status);
+                c->state              = CONTAINER_EXITED;
+                c->termination_reason = REASON_NORMAL_EXIT;
             } else if (WIFSIGNALED(status)) {
                 c->exit_signal = WTERMSIG(status);
-                /* Distinguish hard-limit kill from manual stop */
-                if (c->stop_requested)
-                    c->state = CONTAINER_STOPPED;
-                else
-                    c->state = CONTAINER_KILLED;
+                if (c->stop_requested) {
+                    /* Supervisor issued stop — regardless of which signal */
+                    c->state              = CONTAINER_STOPPED;
+                    c->termination_reason = REASON_STOPPED;
+                } else if (c->exit_signal == SIGKILL) {
+                    /* SIGKILL we didn't send → kernel memory monitor */
+                    c->state              = CONTAINER_KILLED;
+                    c->termination_reason = REASON_HARD_LIMIT_KILLED;
+                } else {
+                    c->state              = CONTAINER_KILLED;
+                    c->termination_reason = REASON_UNKNOWN_SIGNAL;
+                }
             }
 
             unregister_from_monitor(g_ctx->monitor_fd, c->id, pid);
@@ -650,11 +697,13 @@ static void handle_start(supervisor_ctx_t *ctx,
     /* Add metadata record */
     container_record_t *rec = calloc(1, sizeof(container_record_t));
     strncpy(rec->id, req->container_id, sizeof(rec->id) - 1);
-    rec->host_pid          = pid;
-    rec->started_at        = time(NULL);
-    rec->state             = CONTAINER_RUNNING;
-    rec->soft_limit_bytes  = req->soft_limit_bytes;
-    rec->hard_limit_bytes  = req->hard_limit_bytes;
+    rec->host_pid             = pid;
+    rec->started_at           = time(NULL);
+    rec->state                = CONTAINER_RUNNING;
+    rec->soft_limit_bytes     = req->soft_limit_bytes;
+    rec->hard_limit_bytes     = req->hard_limit_bytes;
+    rec->nice_value           = req->nice_value;
+    rec->termination_reason   = REASON_NONE;
     snprintf(rec->log_path, sizeof(rec->log_path),
              "%s/%s.log", LOG_DIR, req->container_id);
 
@@ -679,34 +728,76 @@ static void handle_start(supervisor_ctx_t *ctx,
     free(cfg);   /* child has already exec'd or died; safe to free */
 }
 
+/*
+ * handle_ps – Task 4: ps output must distinguish normal exit, manual stop,
+ * and hard-limit kill.  We also show memory limits and nice value.
+ *
+ * Output is a fixed-width ASCII table sent back to the CLI client.
+ */
 static void handle_ps(supervisor_ctx_t *ctx, control_response_t *resp)
 {
+    /*
+     * We build into a larger local buffer then copy into resp->message.
+     * CONTROL_MESSAGE_LEN is 512 — enough for ~4 containers in a demo.
+     * For a real implementation you'd stream; for a student demo this is fine.
+     */
     char buf[CONTROL_MESSAGE_LEN];
-    buf[0] = '\0';
+    int  pos = 0;
+    int  rem = (int)sizeof(buf) - 1;
+
+#define PS_APPEND(fmt, ...) \
+    do { \
+        int _n = snprintf(buf + pos, rem, fmt, ##__VA_ARGS__); \
+        if (_n > 0) { pos += _n < rem ? _n : rem; rem = (int)sizeof(buf) - 1 - pos; } \
+    } while (0)
 
     pthread_mutex_lock(&ctx->metadata_lock);
+
     container_record_t *c = ctx->containers;
     if (!c) {
-        strncat(buf, "(no containers)\n", sizeof(buf) - strlen(buf) - 1);
+        PS_APPEND("(no containers)\n");
     } else {
-        char line[128];
-        snprintf(line, sizeof(line),
-                 "%-12s %-6s %-10s %-20s\n",
-                 "ID", "PID", "STATE", "STARTED");
-        strncat(buf, line, sizeof(buf) - strlen(buf) - 1);
+        /* Header */
+        PS_APPEND("%-10s %-6s %-9s %-5s %-8s %-8s %-20s\n",
+                  "ID", "PID", "STATE", "NICE",
+                  "SOFT(MB)", "HARD(MB)", "REASON / EXIT");
+
         for (; c; c = c->next) {
-            char ts[20];
-            struct tm *tm = localtime(&c->started_at);
-            strftime(ts, sizeof(ts), "%H:%M:%S", tm);
-            snprintf(line, sizeof(line),
-                     "%-12s %-6d %-10s %-20s\n",
-                     c->id, c->host_pid,
-                     state_to_string(c->state), ts);
-            strncat(buf, line, sizeof(buf) - strlen(buf) - 1);
+            /* Exit info string: show exit code, signal, or reason */
+            char exit_info[32] = {0};
+            if (c->state == CONTAINER_RUNNING ||
+                c->state == CONTAINER_STARTING) {
+                snprintf(exit_info, sizeof(exit_info), "-");
+            } else if (c->termination_reason == REASON_NORMAL_EXIT) {
+                snprintf(exit_info, sizeof(exit_info),
+                         "exit=%d", c->exit_code);
+            } else if (c->termination_reason == REASON_STOPPED) {
+                snprintf(exit_info, sizeof(exit_info),
+                         "stopped(sig=%d)", c->exit_signal);
+            } else if (c->termination_reason == REASON_HARD_LIMIT_KILLED) {
+                snprintf(exit_info, sizeof(exit_info), "hard_limit_killed");
+            } else if (c->termination_reason == REASON_UNKNOWN_SIGNAL) {
+                snprintf(exit_info, sizeof(exit_info),
+                         "signal=%d", c->exit_signal);
+            } else {
+                snprintf(exit_info, sizeof(exit_info), "-");
+            }
+
+            PS_APPEND("%-10s %-6d %-9s %-5d %-8lu %-8lu %-20s\n",
+                      c->id,
+                      c->host_pid,
+                      state_to_string(c->state),
+                      c->nice_value,
+                      c->soft_limit_bytes >> 20,   /* bytes → MiB */
+                      c->hard_limit_bytes >> 20,
+                      exit_info);
         }
     }
+#undef PS_APPEND
+
     pthread_mutex_unlock(&ctx->metadata_lock);
 
+    buf[pos] = '\0';
     resp->status = 0;
     strncpy(resp->message, buf, sizeof(resp->message) - 1);
 }
@@ -753,26 +844,34 @@ static void handle_stop(supervisor_ctx_t *ctx,
         pthread_mutex_unlock(&ctx->metadata_lock);
         resp->status = -1;
         snprintf(resp->message, sizeof(resp->message),
-                 c ? "Container not running" : "No such container: %s",
+                 c ? "Container '%s' is not running"
+                   : "No such container: %s",
                  req->container_id);
         return;
     }
-    /* Mark stop_requested BEFORE sending any signal */
-    c->stop_requested = 1;
-    pid_t pid = c->host_pid;
-    c->state = CONTAINER_STOPPED;
+
+    /*
+     * Task 4 attribution rule: set stop_requested BEFORE sending any signal.
+     * The SIGCHLD handler checks this flag to classify the exit reason as
+     * REASON_STOPPED rather than REASON_HARD_LIMIT_KILLED.
+     */
+    c->stop_requested       = 1;
+    c->termination_reason   = REASON_STOPPED;   /* pre-set; SIGCHLD confirms */
+    c->state                = CONTAINER_STOPPED;
+    pid_t pid               = c->host_pid;
     pthread_mutex_unlock(&ctx->metadata_lock);
 
-    /* Graceful: SIGTERM, then SIGKILL after a short wait */
+    /* Graceful: SIGTERM first, then SIGKILL after 500 ms */
     kill(pid, SIGTERM);
     usleep(500000);
-    /* If still alive after 0.5 s, force-kill */
-    if (waitpid(pid, NULL, WNOHANG) == 0)
+    if (waitpid(pid, NULL, WNOHANG) == 0) {
         kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);   /* reap if SIGCHLD handler hasn't yet */
+    }
 
     resp->status = 0;
     snprintf(resp->message, sizeof(resp->message),
-             "Container '%s' stopped", req->container_id);
+             "Container '%s' (pid %d) stopped", req->container_id, pid);
 }
 
 /* ------------------------------------------------------------------ */
@@ -908,7 +1007,7 @@ static int run_supervisor(const char *rootfs)
         send(client_fd, &resp, sizeof(resp), 0);
         close(client_fd);
 
-        /* For CMD_RUN: block until that container exits */
+        /* For CMD_RUN: block until that container exits, then update metadata */
         if (req.kind == CMD_RUN && resp.status == 0) {
             pthread_mutex_lock(&ctx.metadata_lock);
             container_record_t *c = find_container(&ctx, req.container_id);
@@ -918,17 +1017,26 @@ static int run_supervisor(const char *rootfs)
             if (pid > 0) {
                 int wstatus;
                 waitpid(pid, &wstatus, 0);
-                /* Update metadata */
+
                 pthread_mutex_lock(&ctx.metadata_lock);
                 c = find_container(&ctx, req.container_id);
                 if (c) {
                     if (WIFEXITED(wstatus)) {
-                        c->exit_code = WEXITSTATUS(wstatus);
-                        c->state = CONTAINER_EXITED;
+                        c->exit_code          = WEXITSTATUS(wstatus);
+                        c->state              = CONTAINER_EXITED;
+                        c->termination_reason = REASON_NORMAL_EXIT;
                     } else if (WIFSIGNALED(wstatus)) {
                         c->exit_signal = WTERMSIG(wstatus);
-                        c->state = c->stop_requested
-                                   ? CONTAINER_STOPPED : CONTAINER_KILLED;
+                        if (c->stop_requested) {
+                            c->state              = CONTAINER_STOPPED;
+                            c->termination_reason = REASON_STOPPED;
+                        } else if (c->exit_signal == SIGKILL) {
+                            c->state              = CONTAINER_KILLED;
+                            c->termination_reason = REASON_HARD_LIMIT_KILLED;
+                        } else {
+                            c->state              = CONTAINER_KILLED;
+                            c->termination_reason = REASON_UNKNOWN_SIGNAL;
+                        }
                     }
                 }
                 pthread_mutex_unlock(&ctx.metadata_lock);
