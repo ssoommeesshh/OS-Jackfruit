@@ -334,8 +334,8 @@ The project uses two distinct IPC mechanisms:
 
 | Container | Nice | Duration | Final accumulator |
 |---|---|---|---|
-| cpu-hi | 0 | 10 s | 17,925,039,809,008,301,423 |
-| cpu-lo | 15 | 10 s | 1,454,211,411,801,142,928 |
+| cpu-hi | 0 | 10 s | 11703206813403826209 |
+| cpu-lo | 15 | 10 s | 4320434704694582462 |
 
 Both completed in the same wall-clock time because `cpu_hog` runs a fixed 10-second loop (not a fixed number of iterations). The scheduling difference shows up in the **accumulator value** — the amount of arithmetic work completed within that window. `cpu-hi` completed roughly 12x more work than `cpu-lo`.
 
@@ -408,42 +408,15 @@ Both completed in the same wall-clock time because `cpu_hog` runs a fixed 10-sec
 
 **Raw data:**
 
-`cpu-hi` (nice=0):
-```
-cpu_hog alive elapsed=1  accumulator=3343926782829680890
-cpu_hog alive elapsed=2  accumulator=16172246736669119818
-cpu_hog alive elapsed=3  accumulator=10793442278965698620
-cpu_hog alive elapsed=4  accumulator=8217928435725416606
-cpu_hog alive elapsed=5  accumulator=17391403602366311407
-cpu_hog alive elapsed=6  accumulator=4338168713548856136
-cpu_hog alive elapsed=7  accumulator=4857681995416814497
-cpu_hog alive elapsed=8  accumulator=12597444233840887773
-cpu_hog alive elapsed=9  accumulator=2501345406374343071
-cpu_hog done  duration=10 accumulator=17925039809008301423
-```
-
-`cpu-lo` (nice=15):
-```
-cpu_hog alive elapsed=1  accumulator=8026618524129087813
-cpu_hog alive elapsed=2  accumulator=3899059916435297540
-cpu_hog alive elapsed=3  accumulator=14007430071472569636
-cpu_hog alive elapsed=4  accumulator=2381529379175017952
-cpu_hog alive elapsed=5  accumulator=15506756475746764138
-cpu_hog alive elapsed=6  accumulator=16268879837341124441
-cpu_hog alive elapsed=7  accumulator=6375111844367682836
-cpu_hog alive elapsed=8  accumulator=14335595529567625540
-cpu_hog alive elapsed=9  accumulator=17061402887183903557
-cpu_hog alive elapsed=10 accumulator=1454211411801142928
-cpu_hog done  duration=10 accumulator=1454211411801142928
-```
+![Raw-data](screenshots-jk/7-schedule.png)
 
 **Comparison table:**
 
 | Metric | cpu-hi (nice=0) | cpu-lo (nice=15) |
 |--------|-----------------|------------------|
 | Wall time | 10 s | 10 s |
-| Final accumulator | 17,925,039,809,008,301,423 | 1,454,211,411,801,142,928 |
-| Relative CPU share | ~12x higher | ~12x lower |
+| Final accumulator | 11703206813403826209 | 4320434704694582462 |
+| Relative CPU share | ~2.7x higher | ~2.7x lower |
 
 **What the results show:**
 
