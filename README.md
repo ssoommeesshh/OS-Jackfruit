@@ -228,7 +228,7 @@ The kernel module sent SIGKILL at ~64.5 MiB RSS (above the 60 MiB hard limit). B
 Log outputs after both completed:
 
 
-![Scheduling-experiment](screenshots-jk/7-schedule.ong)
+![Scheduling-experiment](screenshots-jk/7-schedule.png)
 
 Two containers (`cpu-hi` and `cpu-lo`) were started with different scheduling priorities:
 - `cpu-hi`: nice = 0 (higher priority)
