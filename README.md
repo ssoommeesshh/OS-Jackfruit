@@ -174,7 +174,7 @@ make -C boilerplate ci
 
 **Log file contents captured through the pipe → bounded buffer → consumer thread → file pipeline.**
 
-![Bounded-buffer logging](screenshots-jk/3-logs.png)
+![Bounded-buffer logging](screenshots-jk/3-ipc.png)
 
 Both `alpha.log` and `beta.log` present simultaneously, capturing distinct container outputs through a single shared bounded buffer with no data loss or interleaving.
 
