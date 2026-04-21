@@ -174,7 +174,7 @@ make -C boilerplate ci
 
 **Log file contents captured through the pipe → bounded buffer → consumer thread → file pipeline.**
 
-![Bounded-buffer logging](screenshots-jk/3-ipc.png)
+![cli-and-IPC](screenshots-jk/4-logs.png)
 
 Both `alpha.log` and `beta.log` present simultaneously, capturing distinct container outputs through a single shared bounded buffer with no data loss or interleaving.
 
@@ -185,7 +185,8 @@ Both `alpha.log` and `beta.log` present simultaneously, capturing distinct conta
 
 **CLI command sent to supervisor over UNIX domain socket; supervisor responds.**
 
-![cli-and-IPC](screenshots-jk/4-logs.png)
+
+![Bounded-buffer logging](screenshots-jk/3-ipc.png)
 
 The control channel is a UNIX domain socket at `/tmp/mini_runtime.sock`. Each CLI invocation is a separate process that connects, sends one `control_request_t` struct, reads one `control_response_t` struct, prints the message, and exits. This is entirely separate from the logging pipes.
 
